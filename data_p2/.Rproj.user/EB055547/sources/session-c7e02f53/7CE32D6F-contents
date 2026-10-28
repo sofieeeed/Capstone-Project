@@ -1,0 +1,381 @@
+---
+title: "Goudge Basins Analysis"
+output: html_document
+date: "2026-10-22"
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+
+# create exports folder for everything created to live in
+dir.create(here::here("outputs"))
+```
+
+```{r}
+#| label: load-basins-db
+# used ArcGis Pro to load in shapefile from Goudge et al database of lake basins on Mars
+# downloaded attribute table as .xls file
+basins <- readxl::read_excel(here::here("basins_base_table.xls"))
+glimpse(basins)
+```
+## Basins dataset
+FID - Individual ID added by ArcGis (doesn't matter)
+Lat, Long - Location of basin's center
+Type - Open or closed basin
+Num - Basin number
+Inlet - Valley type
+  - II = isolated inlet valley
+  - VN = valley network era
+Degr - Degradation state (Robbins and Hynek, 2012)
+DegrNote - Any notes on degradation state
+Strahler - Strahler order (determines  the number and scale of tributaries)
+StrahNote - Notes on Strahler order
+StrahRef - Where the order came from (from Hynek et al (2010) where possible)
+Ejecta - Ejecta is stuff ejected from the crater upon impact. This field is reffering to how eroded the ejecta is
+
+```{r}
+#| label: modify-data
+count(basins, Type)
+# 205 closed, 220 open
+
+# each basin type starts its num at 1 (so there's two 1s in the dataset under the Num column)
+# merge Type and Num --> each basin has a unique identifier that tells you what it is and what number it is
+basins <- basins |>
+  mutate(basin_id = paste0(Type, "_", Num))
+```
+## Scoring
+
+I'm going to set up a scoring system to rank how "good" each basin would be at hosting and then preserving life. This only uses what's in the Goudge et al. (2016) catalog (basin degradation, inlet type, stream order, and basin type), so it's a preliminary exploration of the basins. I'll join more data later, like geologic unit/age.
+
+To weight the criteria, I used the Analytic Hierarchy Process (AHP). I ranked the criteria by how much they matter for this project, compared each pair on Saaty's 1-9 scale, and turned those comparisons into weights. AHP also gives a consistency ratio that checks whether my comparisons contradict each other (under 0.10 is acceptable).
+
+My priorities, in order:
+1. Preservation: how intact the host crater is (Robbins & Hynek 2012 degradation state). This is a stand-in for whether lake deposits survived, not a direct measure.
+2. Inlet type: valley network-fed (VN) lakes are older and fed by bigger systems; isolated inlet (II) lakes are younger and more likely episodic.
+3. Stream order: higher order means a bigger watershed and longer-lasting water.
+4. Basin type: closed basins score slightly higher than open ones because they favor preservation, even though open basins may have had more nutrients.
+
+Location isn't included (at least for now).
+
+```{r}
+#| label: ahp-math
+# AHP math following:  https://rpubs.com/mpetric/ahpr 
+
+# criteria in priority order
+criteria <- c(
+  "preserve",
+  "inlet",
+  "order",
+  "type"
+)
+
+# Saaty's 1-9 scale: 1 = equal, 3 = moderately more important, 5 = strongly more
+# each row says how much more important that criterion is than each column
+comparisons <- matrix(
+  c(
+    # preserve  inlet  order  type
+         1,       3,     4,     5,    # preserve
+       1/3,       1,     2,     3,    # inlet
+       1/4,     1/2,     1,     2,    # order
+       1/5,     1/3,   1/2,     1     # type
+  ),
+  nrow = 4,
+  byrow = TRUE
+)
+rownames(comparisons) <- criteria
+colnames(comparisons) <- criteria
+comparisons
+
+# check the matrix is reciprocal ----
+# if A vs B = 3 then B vs A has to be 1/3
+# t(1 / comparisons) flips the matrix and inverts every value, so it should match the original
+all.equal(comparisons, t(1 / comparisons))
+# TRUE = yes we're good to go
+
+# eigenvator method for deriving weight
+eig <- eigen(comparisons)
+eig
+
+lambda_max <- Re(eig$values[1])
+lambda_max
+
+principal_vector <- Re(eig$vectors[, 1])
+principal_vector
+
+weights <- principal_vector / sum(principal_vector)
+names(weights) <- criteria
+weights
+# check math done correctly 
+sum(weights)       # sum = 1, yes correct
+
+# consistency check
+n <- length(criteria)
+# consistency index
+ci <- (lambda_max - n) / (n - 1)
+# random index table (saaty), pick the one for n criteria --> 0.90 for 4
+RI_table <- c(0.00, 0.00, 0.58, 0.90, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49)
+ri <- RI_table[n]
+# consistency ratio
+cr <- ci / ri
+round(cr, 3)  # cr < 0.10 means means pairwise comparisons are consistent with each other, good to continue
+
+# results table
+results <- data.frame(
+  criterion = criteria,
+  weight = weights
+)
+results
+```
+### AHP results
+
+The AHP returned these results:
+| Criterion | Weight |
+|---|---|
+| Preservation | 0.546 |
+| Inlet type | 0.232 |
+| Stream order | 0.138 |
+| Basin type | 0.084 |
+
+The consistency ratio was 0.019, which is well under Saaty's 0.10 cutoff, so my pairwise comparisons are consistent and the weights can be used.
+
+Preservation ends up with over half the total weight, so it will drive most of the ranking. Inlet type and stream order together add about another third, and basin type only slightly adjusts the scores.
+
+### Assigning scores
+
+Next, each basin gets a score from 0 to 1 for each criterion. Each score is multiplied by its weight, and the four weighted scores are added together to make one final score (also 0 to 1). A higher score means a basin is better for hosting and then preserving life, based on the morphology in this catalog.
+
+```{r}
+#| label: scoring
+# score each basin from 0 to 1 on each criterion
+basins <- basins |>
+  mutate(
+    # preservation: 4 is the freshest so it gets a 1.
+    # 0 means heavily eroded/not in the Robbins & Hynek database,
+    # Goudge et al. (2016) count those as a 1, so I'm doing the same
+    score_preserve = case_when(
+      Degr == 4 ~ 1,
+      Degr == 3 ~ 0.75,
+      Degr == 2 ~ 0.5,
+      Degr == 1 ~ 0.25,
+      Degr == 0 ~ 0.25
+    ),
+    # inlet: VN (older, bigger systems) is better than II (younger, episodic)
+    score_inlet = if_else(Inlet == "VN", 1, 0.5),
+    # stream order: 5 and up all count as the max (there's only a few higher than 5 and I don't want them to stretch the scale)
+    score_order = case_when(
+      Strahler >= 5 ~ 1,
+      Strahler == 4 ~ 0.75,
+      Strahler == 3 ~ 0.5,
+      Strahler == 2 ~ 0.25,
+      TRUE ~ 0
+    ),
+    # basin type: closed a bit higher than open b/c of better preservation potential
+    score_type = if_else(Type == "CBL", 1, 0.75)
+  )
+
+# final score = each criterion score times its AHP weight, added together
+basins <- basins |>
+  mutate(
+    score = weights["preserve"] * score_preserve +
+      weights["inlet"] * score_inlet +
+      weights["order"] * score_order +
+      weights["type"] * score_type,
+    score = round(score, 3)
+  )
+
+# rank them. min_rank gives ties the same rank
+basins <- basins |>
+  mutate(rank = min_rank(desc(score)))
+
+summary(basins$score)
+
+# taking a look at top basins
+basins |>
+  arrange(desc(score)) |>
+  select(basin_id, Lat, Lon, Inlet, Strahler, Degr, score, rank) |>
+  head(20)
+```
+
+## Aqueously-Altered Minerals
+
+The Goudge database doesn't have any information about what rock types are present, and different lithologies have different preservation capabilities. In my lit review, I found that fine-grained clay-rich rocks, carbonates, and silica-rich rocks are where microfossils are most commonly found on Earth. So a basin's mineralogy should matter just as much as its shape.
+
+As a first step, I'm adding the Carter et al. (2013) global map of hydrous mineral detections. It shows where the CRISM and OMEGA orbital spectrometers detected minerals that form through water-rock interaction (clays, sulfates, carbonates, and hydrated silica). 
+
+For each basin, I'll count how many detections fall inside or near the basin. The Goudge et al. (2016) database only records each basin's center point, not its size, so I needed another source to define a search area. I used two:
+- Fassett and Head (2008), Table 2: lake area for 73 open-basin lakes, measured from the elevation of each lake's outlet. This is the size of the lake itself, so I use it whenever it's available.
+- The Robbins and Hynek crater database (2020 release): crater rim diameter. About 85% of the basins sit inside impact craters, so I matched each basin to the crater it's in and used that diameter for the basins Fassett and Head don't cover.
+
+The crater database doesn't share an ID with the Goudge catalog, so I matched them by location in ArcGIS Pro. The crater longitudes run 0-360°E while Goudge's run -180 to 180°, so I first converted the crater longitudes to match. Then I buffered every crater by its radius (geodesic, GCS_Mars_2000) and used a one-to-many Spatial Join to find every crater circle each basin falls inside, and exported the result.
+
+In R, where a basin fell inside more than one crater (for example a small crater inside a big one), I kept the crater whose center was closest to the basin point, as long as the basin was within half that crater's radius. This matched 343 basins, and Jezero (OBL_45) came out at 47.5 km, which is correct. One basin (OBL_84) matched a small 1.9 km crater on its floor instead of its host crater, but its size comes from Fassett and Head instead.
+
+Fassett and Head (2008) didn't need a spatial join. Goudge et al. (2016) use Fassett and Head's lake numbers for the open basins, so I joined their lake areas by lake number (72 of their 73 lakes are in the Goudge catalog). I converted each lake area to an equivalent diameter (d = 2 * sqrt(area / pi)).
+
+Together these give sizes for 370 of the 425 basins. The other 55 are mostly heavily eroded basins between craters with no crater or lake measurement, so for those I used the median radius of the sized basins (~17 km) as the search radius.
+
+```{r}
+#| label: crater-size-calcs
+
+# Mars' mean radius in meters, for geosphere distances
+mars_radius_m <- 3389500
+
+# crater sizes
+# spatial join output from ArcGIS (one row per basin-crater pair)
+# field names got cut to 10 characters on export:
+# DIAM_CIRC_ = crater diameter (km), LAT_CIRC_I = crater center lat, correct_lo = crater center lon (-180 to 180)
+crater_join <- read_csv(here::here("data", "basins_w_size_craters.csv"), show_col_types = FALSE)
+
+# keep the crater whose center is closest to the basin center as long as the basin is within half that crater's radius
+crater_matches <- crater_join |>
+  filter(!is.na(CRATER_ID)) |>
+  mutate(
+    basin_id = paste0(Type, "_", Num),
+    # distance from basin center to crater center (Haversine, Mars' radius)
+    crater_offset_km = geosphere::distHaversine(
+      cbind(Lon, Lat),
+      cbind(correct_lo, LAT_CIRC_I),
+      r = mars_radius_m
+    ) / 1000,      # convert to km
+    # how far off center the basin is, as a fraction of the crater's radius
+    off_center = crater_offset_km / (DIAM_CIRC_ / 2)
+  ) |>
+  filter(off_center <= 0.5) |>
+  group_by(basin_id) |>
+  slice_min(crater_offset_km, n = 1) |>
+  ungroup() |>
+  select(basin_id, crater_id = CRATER_ID, crater_diam_km = DIAM_CIRC_, crater_offset_km)
+
+nrow(crater_matches)
+# 343 basins matched a crater
+
+basins <- basins |>
+  left_join(crater_matches, by = "basin_id")
+
+# lake sizes
+# Fassett & Head lake numbers = Goudge open basin numbers
+# turning lake area into a diameter as if the lake were a circle: area = pi * r^2, so d = 2 * sqrt(area / pi)
+fassett_head <- read_csv(here::here("data", "fassett_head_2008_table2.csv"), show_col_types = FALSE) |>
+  mutate(
+    basin_id = paste0("OBL_", lake_number),
+    lake_diam_km = round(2 * sqrt(area_km2 / pi), 1)
+  ) |>
+  select(basin_id, lake_area_km2 = area_km2, lake_diam_km)
+
+basins <- basins |>
+  left_join(fassett_head, by = "basin_id")
+
+# remove duplicate columns from join
+basins <- basins |>
+  select(-ends_with(".y")) |>
+  rename_with(~ str_remove(.x, "\\.x$"), ends_with(".x"))
+names(basins)
+
+# combine into one size
+# lake size is the actual extent of the water, so prioritize using it (if a basin has one) over crater diameter
+basins <- basins |>
+  mutate(
+    basin_diam_km = if_else(!is.na(lake_diam_km), lake_diam_km, crater_diam_km),
+    size_source = case_when(
+      !is.na(lake_diam_km) ~ "Fassett & Head lake",
+      !is.na(crater_diam_km) ~ "Robbins & Hynek crater",
+      TRUE ~ "none"
+    )
+  )
+
+# if we can't find a basin's size, use the median radius of the basins that do have one
+# (has to come after the combine step, since that's where basin_diam_km gets made)
+fallback_radius_km <- median(basins$basin_diam_km, na.rm = TRUE) / 2
+fallback_radius_km
+# 16.78 km
+
+# search radius for the hydrous minerals: half the basin diameter, or the median radius if there's no size
+basins <- basins |>
+  mutate(search_radius_km = if_else(is.na(basin_diam_km), fallback_radius_km, basin_diam_km / 2))
+
+count(basins, size_source)
+# 72 lake, 298 crater, 55 none (median radius used)
+summary(basins$search_radius_km)
+```
+
+```{r}
+#| label: hydrous-site-count
+# finally can add now that we have search radius added
+
+# Carter et al. (2013)
+hydrous <- read_csv(here::here("data", "hydrous_sites_carter2013.csv"), show_col_types = FALSE)
+
+basin_hydrous_pairs <- basins |>
+  select(basin_id, Lon, Lat, search_radius_km) |>
+  cross_join(hydrous)
+
+# distance between each hydrous site and each basin
+basin_hydrous_pairs <- basin_hydrous_pairs |>
+  mutate(
+    dist_km = geosphere::distHaversine(
+      cbind(Lon, Lat),
+      cbind(lon, lat),
+      r = mars_radius_m
+    ) / 1000
+  )
+
+# grouping by basin ID
+# counting sites within the basin's search radius, plus within 1.5x the radius.
+# the 1.5x buffer catches detections on crater rims and just outside the lake, and allows for uncertainty in my basin sizes and in where each Carter point sits (one location per detection, not the whole outcrop)
+hydrous_counts <- basin_hydrous_pairs |>
+  group_by(basin_id) |>
+  summarise(
+    hydrous_n = sum(dist_km <= search_radius_km),
+    hydrous_n_1.5x = sum(dist_km <= 1.5 * search_radius_km),
+    hydrous_nearest_km = round(min(dist_km), 1)
+  )
+
+# add the counts to basins
+# (dropping these columns first so rerunning the chunk doesn't make .x/.y duplicates)
+basins <- basins |>
+  select(-any_of(c("hydrous_n", "hydrous_n_1.5x", "hydrous_nearest_km"))) |>
+  left_join(hydrous_counts, by = "basin_id")
+
+# how many basins have at least one detection
+basins |>
+  summarise(
+    with_hydrous = sum(hydrous_n > 0),
+    with_hydrous_1.5x = sum(hydrous_n_1.5x > 0)
+  )
+# 41 and 58
+
+# Jezero
+basins |>
+  filter(basin_id == "OBL_45") |>
+  select(basin_id, search_radius_km, hydrous_n, hydrous_n_1.5x, hydrous_nearest_km)
+# 0 inside the radius, 1 within 1.5x, nearest ~21.8 km 
+# (1.1x crater radius, so just outside)
+```
+```{r}
+#| label: top-basins
+
+# shortlist = basins with a hydrous detection within 1.5x their radius, ranked by AHP score,
+basins_1.5 <- basins |>
+  filter(hydrous_n_1.5x > 0) |>
+  arrange(desc(score)) |>
+  select(basin_id, Lat, Lon, Type, Inlet, score, rank,
+         basin_diam_km, hydrous_n, hydrous_n_1.5x, hydrous_nearest_km)
+
+nrow(basins_1.5)
+# 58 made it in
+
+top_25_basins <-
+  shortlist|> head(25)
+top_25_basins
+
+write_csv(top_25_basins, here::here("outputs", "top_25_basins.csv"))
+```
+
+
+
+
+
+
+
+

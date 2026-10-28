@@ -1,0 +1,6 @@
+"0","#| label: load-data"
+"0","df <- readr::read_csv(here::here(""data"", ""pbdb_data.csv""))"
+"1","[1m[33mError[39m:[22m
+[38;5;232m[33m![38;5;232m ]8;;file://D:/CapstoneProject/Goudge_basins/data/pbdb_data.csv[34mD:/CapstoneProject/Goudge_basins/data/pbdb_data.csv[38;5;232m]8;; does not exist.[39m
+[90mRun `]8;;x-r-run:rlang::last_trace()rlang::last_trace()]8;;` to see where the error occurred.[39m
+"

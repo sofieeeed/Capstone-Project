@@ -1,0 +1,6 @@
+"0","# 205 closed, 220 open"
+"0",""
+"0","# each basin type starts its num at 1 (so there's two 1s in the dataset under the Num column)"
+"0","# merge Type and Num --> each basin has a unique identifier that tells you what it is and what number it is"
+"0","basins <- basins |>"
+"0","  mutate(basin_id = paste0(Type, ""_"", Num))"
