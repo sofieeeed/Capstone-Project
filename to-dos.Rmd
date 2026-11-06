@@ -1,0 +1,27 @@
+---
+title: "to-do"
+output: html_document
+date: "2026-10-30"
+---
+
+Paper
+- intro
+- background
+
+
+
+Data pt1
+- finish midterm by MONDAY
+
+Data pt2
+- combo w/lithology
+- readMe
+
+
+Datap3
+- find crater rasters
+
+portfolio website
+
+infographic
+
